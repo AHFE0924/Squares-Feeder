@@ -25,8 +25,7 @@ jobs:
 
       - name: Run Scraper
         env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME || 'token' }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY || secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: python scrapescrapescrape.py
 
       - name: Commit and Push Changes
