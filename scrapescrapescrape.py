@@ -1,9 +1,14 @@
 import os
+import sys
 import glob
 import shutil
+import subprocess
 import numpy as np
 import pandas as pd
 from kaggle.api.kaggle_api_extended import KaggleApi
+
+# Force live real-time logging in GitHub Actions
+sys.stdout.reconfigure(line_buffering=True)
 
 def calc_bounding_box(x, y, deg):
     rad = np.deg2rad(deg)
@@ -22,22 +27,26 @@ def is_valid_packing(x, y, deg, tol=1e-7):
     np.fill_diagonal(dist2, 999.0)
     if np.min(dist2) < 1.0 - tol:
         return False
-    i_idx, j_idx = np.where((dist2 < 2.0 + 1e-5) & (np.triu(np.ones((n, n), dtype=bool), 1)))
+
+    mask = np.triu(dist2 < 2.0 + 1e-5, k=1)
+    i_idx, j_idx = np.where(mask)
     if len(i_idx) == 0:
         return True
+
     rad = np.deg2rad(deg)
     c, s = np.cos(rad), np.sin(rad)
-    for i, j in zip(i_idx, j_idx):
-        rx, ry = x[j] - x[i], y[j] - y[i]
-        for ux, uy in ((c[i], s[i]), (-s[i], c[i]), (c[j], s[j]), (-s[j], c[j])):
-            proj_dist = abs(rx * ux + ry * uy)
-            ri = 0.5 * (abs(ux * c[i] + uy * s[i]) + abs(-ux * s[i] + uy * c[i]))
-            rj = 0.5 * (abs(ux * c[j] + uy * s[j]) + abs(-ux * s[j] + uy * c[j]))
-            if proj_dist >= ri + rj - tol:
-                break
-        else:
-            return False
-    return True
+    rx, ry = x[j_idx] - x[i_idx], y[j_idx] - y[i_idx]
+    ci, si = c[i_idx], s[i_idx]
+    cj, sj = c[j_idx], s[j_idx]
+
+    thresh = 0.5 + 0.5 * (np.abs(ci * cj + si * sj) + np.abs(ci * sj - si * cj)) - tol
+    p1 = np.abs(rx * ci + ry * si)
+    p2 = np.abs(-rx * si + ry * ci)
+    p3 = np.abs(rx * cj + ry * sj)
+    p4 = np.abs(-rx * sj + ry * cj)
+
+    max_sep = np.maximum(np.maximum(p1, p2), np.maximum(p3, p4))
+    return bool(np.all(max_sep >= thresh))
 
 def extract_puzzle_key(df):
     cols = {c.lower(): c for c in df.columns}
@@ -53,38 +62,43 @@ def extract_puzzle_key(df):
     return None
 
 def run_scraper():
+    print("Authenticating with Kaggle API...", flush=True)
     api = KaggleApi()
     api.authenticate()
     os.makedirs("downloads", exist_ok=True)
 
     seen_refs = set()
     for sort_mode in ["hotness", "dateRun", "voteCount"]:
+        print(f"Checking top notebooks by {sort_mode}...", flush=True)
         try:
-            kernels = api.kernels_list(competition="squares-in-squares", sort_by=sort_mode, page_size=15)
+            kernels = api.kernels_list(competition="squares-in-squares", sort_by=sort_mode, page_size=6)
             for k in kernels:
                 if k.ref not in seen_refs:
                     seen_refs.add(k.ref)
                     out_dir = os.path.join("downloads", k.ref.replace("/", "_"))
                     os.makedirs(out_dir, exist_ok=True)
-                    print(f"[{sort_mode}] Downloading: {k.ref}")
+                    print(f"  -> Downloading {k.ref} (25s timeout)...", flush=True)
                     try:
-                        api.kernels_output(k.ref, path=out_dir)
-                    except Exception as e:
-                        print(f"Skipping {k.ref}: {e}")
+                        subprocess.run(
+                            ["kaggle", "kernels", "output", k.ref, "-p", out_dir, "-q"],
+                            timeout=25,
+                            check=False
+                        )
+                    except subprocess.TimeoutExpired:
+                        print(f"  -> Timeout on {k.ref}, skipping!", flush=True)
         except Exception as e:
-            print(f"Sort {sort_mode} error: {e}")
+            print(f"Sort {sort_mode} error: {e}", flush=True)
 
     csv_files = glob.glob("downloads/**/*.csv", recursive=True)
     if os.path.exists("latest_public.csv"):
         csv_files.append("latest_public.csv")
 
+    print(f"Found {len(csv_files)} CSV files. Starting puzzle-level ensemble...", flush=True)
     if not csv_files:
-        print("No CSVs found.")
         return
 
     best_packings = {}
     best_scores = {}
-    template_cols = None
 
     for path in csv_files:
         if os.path.getsize(path) < 100000:
@@ -92,8 +106,7 @@ def run_scraper():
         try:
             df = pd.read_csv(path)
             cols = {c.lower(): c for c in df.columns}
-            x_col = cols.get("x")
-            y_col = cols.get("y")
+            x_col, y_col = cols.get("x"), cols.get("y")
             a_col = cols.get("deg") or cols.get("angle") or cols.get("theta") or cols.get("r")
             if not (x_col and y_col and a_col):
                 continue
@@ -102,10 +115,8 @@ def run_scraper():
             if p_key is None:
                 continue
 
-            if template_cols is None:
-                template_cols = list(df.columns)
-
             df["_p_key"] = p_key
+            improvements = 0
             for n_val, group in df.groupby("_p_key", sort=False):
                 n_int = int(n_val)
                 if len(group) != n_int:
@@ -118,18 +129,20 @@ def run_scraper():
                     if is_valid_packing(x, y, deg):
                         best_scores[n_int] = L
                         best_packings[n_int] = group.drop(columns=["_p_key"]).copy()
+                        improvements += 1
+            print(f"Parsed {path} -> {improvements} puzzle upgrades", flush=True)
         except Exception as e:
-            print(f"Error parsing {path}: {e}")
+            print(f"Error parsing {path}: {e}", flush=True)
 
     if len(best_packings) >= 900:
         merged_df = pd.concat([best_packings[k] for k in sorted(best_packings.keys())], ignore_index=True)
         merged_df.to_csv("latest_public.csv", index=False)
-        print(f"Ensembled {len(best_packings)} puzzles! Total L score: {sum(best_scores.values()):.5f}")
+        print(f"SUCCESS: Ensembled {len(best_packings)} puzzles! Total L: {sum(best_scores.values()):.5f}", flush=True)
     else:
         best_csv = max(csv_files, key=os.path.getsize)
         if best_csv != "latest_public.csv":
             shutil.copy(best_csv, "latest_public.csv")
-        print(f"Fallback: copied {best_csv}")
+        print(f"Fallback: copied {best_csv}", flush=True)
 
 if __name__ == "__main__":
     run_scraper()
