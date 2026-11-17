@@ -10,14 +10,18 @@ from kaggle.api.kaggle_api_extended import KaggleApi
 # Force live real-time logging in GitHub Actions
 sys.stdout.reconfigure(line_buffering=True)
 
-def calc_bounding_box(x, y, deg):
-    rad = np.deg2rad(deg)
+def to_radians(ang):
+    # Auto-detects if angles are already in radians [-pi, pi] or degrees
+    return ang if np.max(np.abs(ang)) <= np.pi + 1e-4 else np.deg2rad(ang)
+
+def calc_bounding_box(x, y, ang):
+    rad = to_radians(ang)
     r = 0.5 * (np.abs(np.cos(rad)) + np.abs(np.sin(rad)))
     lx = np.max(x + r) - np.min(x - r)
     ly = np.max(y + r) - np.min(y - r)
     return float(max(lx, ly))
 
-def is_valid_packing(x, y, deg, tol=1e-7):
+def is_valid_packing(x, y, ang, tol=1e-7):
     n = len(x)
     if n <= 1:
         return True
@@ -33,7 +37,7 @@ def is_valid_packing(x, y, deg, tol=1e-7):
     if len(i_idx) == 0:
         return True
 
-    rad = np.deg2rad(deg)
+    rad = to_radians(ang)
     c, s = np.cos(rad), np.sin(rad)
     rx, ry = x[j_idx] - x[i_idx], y[j_idx] - y[i_idx]
     ci, si = c[i_idx], s[i_idx]
@@ -68,7 +72,7 @@ def run_scraper():
     os.makedirs("downloads", exist_ok=True)
 
     seen_refs = set()
-    for sort_mode in ["hotness", "dateRun", "voteCount"]:
+    for sort_mode in ["scoreAscending", "hotness", "dateRun", "voteCount"]:
         print(f"Checking top notebooks by {sort_mode}...", flush=True)
         try:
             kernels = api.kernels_list(competition="squares-in-squares", sort_by=sort_mode, page_size=6)
@@ -123,10 +127,10 @@ def run_scraper():
                     continue
                 x = group[x_col].to_numpy(dtype=np.float64)
                 y = group[y_col].to_numpy(dtype=np.float64)
-                deg = group[a_col].to_numpy(dtype=np.float64)
-                L = calc_bounding_box(x, y, deg)
+                ang = group[a_col].to_numpy(dtype=np.float64)
+                L = calc_bounding_box(x, y, ang)
                 if L < best_scores.get(n_int, float("inf")) - 1e-9:
-                    if is_valid_packing(x, y, deg):
+                    if is_valid_packing(x, y, ang):
                         best_scores[n_int] = L
                         best_packings[n_int] = group.drop(columns=["_p_key"]).copy()
                         improvements += 1
@@ -137,7 +141,8 @@ def run_scraper():
     if len(best_packings) >= 900:
         merged_df = pd.concat([best_packings[k] for k in sorted(best_packings.keys())], ignore_index=True)
         merged_df.to_csv("latest_public.csv", index=False)
-        print(f"SUCCESS: Ensembled {len(best_packings)} puzzles! Total L: {sum(best_scores.values()):.5f}", flush=True)
+        comp_score = sum((best_scores[n] - np.sqrt(n)) / np.sqrt(n) for n in best_scores)
+        print(f"SUCCESS: Ensembled {len(best_packings)} puzzles! Kaggle Score: {comp_score:.6f} | Total L: {sum(best_scores.values()):.5f}", flush=True)
     else:
         best_csv = max(csv_files, key=os.path.getsize)
         if best_csv != "latest_public.csv":
