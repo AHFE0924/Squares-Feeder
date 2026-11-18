@@ -66,6 +66,17 @@ def run_scraper():
     os.makedirs("downloads", exist_ok=True)
 
     seen_refs = set()
+    print("Checking your own Kaggle notebooks (mine=True)...", flush=True)
+    try:
+        for k in api.kernels_list(mine=True, competition="squares-in-squares", page_size=10):
+            if k.ref not in seen_refs:
+                seen_refs.add(k.ref)
+                out_dir = os.path.join("downloads", k.ref.replace("/", "_"))
+                os.makedirs(out_dir, exist_ok=True)
+                print(f"  -> Downloading YOUR notebook {k.ref} (25s timeout)...", flush=True)
+                subprocess.run(["kaggle", "kernels", "output", k.ref, "-p", out_dir, "-q"], timeout=25, check=False)
+    except Exception as e:
+        print(f"Mine kernels error: {e}", flush=True)
     for sort_mode in ["scoreAscending", "hotness", "dateRun", "voteCount"]:
         print(f"Checking top notebooks by {sort_mode}...", flush=True)
         try:
