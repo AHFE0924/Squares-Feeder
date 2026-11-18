@@ -10,18 +10,13 @@ from kaggle.api.kaggle_api_extended import KaggleApi
 # Force live real-time logging in GitHub Actions
 sys.stdout.reconfigure(line_buffering=True)
 
-def to_radians(ang):
-    # Auto-detects if angles are already in radians [-pi, pi] or degrees
-    return ang if np.max(np.abs(ang)) <= np.pi + 1e-4 else np.deg2rad(ang)
-
-def calc_bounding_box(x, y, ang):
-    rad = to_radians(ang)
+def calc_bounding_box(x, y, rad):
     r = 0.5 * (np.abs(np.cos(rad)) + np.abs(np.sin(rad)))
     lx = np.max(x + r) - np.min(x - r)
     ly = np.max(y + r) - np.min(y - r)
     return float(max(lx, ly))
 
-def is_valid_packing(x, y, ang, tol=1e-7):
+def is_valid_packing(x, y, rad, tol=1e-7):
     n = len(x)
     if n <= 1:
         return True
@@ -37,7 +32,6 @@ def is_valid_packing(x, y, ang, tol=1e-7):
     if len(i_idx) == 0:
         return True
 
-    rad = to_radians(ang)
     c, s = np.cos(rad), np.sin(rad)
     rx, ry = x[j_idx] - x[i_idx], y[j_idx] - y[i_idx]
     ci, si = c[i_idx], s[i_idx]
@@ -93,9 +87,11 @@ def run_scraper():
         except Exception as e:
             print(f"Sort {sort_mode} error: {e}", flush=True)
 
-    csv_files = glob.glob("downloads/**/*.csv", recursive=True)
+    # Load latest_public.csv FIRST so downloaded CSVs only log true upgrades over baseline
+    csv_files = []
     if os.path.exists("latest_public.csv"):
         csv_files.append("latest_public.csv")
+    csv_files.extend(glob.glob("downloads/**/*.csv", recursive=True))
 
     print(f"Found {len(csv_files)} CSV files. Starting puzzle-level ensemble...", flush=True)
     if not csv_files:
@@ -111,7 +107,7 @@ def run_scraper():
             df = pd.read_csv(path)
             cols = {c.lower(): c for c in df.columns}
             x_col, y_col = cols.get("x"), cols.get("y")
-            a_col = cols.get("deg") or cols.get("angle") or cols.get("theta") or cols.get("r")
+            a_col = cols.get("angle") or cols.get("deg") or cols.get("theta") or cols.get("r")
             if not (x_col and y_col and a_col):
                 continue
 
@@ -119,27 +115,49 @@ def run_scraper():
             if p_key is None:
                 continue
 
+            # Detect degrees vs radians across the whole file so small degree angles aren't misread
+            is_degrees = float(df[a_col].abs().max()) > np.pi + 1e-3
+
             df["_p_key"] = p_key
             improvements = 0
             for n_val, group in df.groupby("_p_key", sort=False):
                 n_int = int(n_val)
                 if len(group) != n_int:
                     continue
+                if "square_id" in cols:
+                    group = group.sort_values(cols["square_id"])
                 x = group[x_col].to_numpy(dtype=np.float64)
                 y = group[y_col].to_numpy(dtype=np.float64)
-                ang = group[a_col].to_numpy(dtype=np.float64)
-                L = calc_bounding_box(x, y, ang)
+                raw_ang = group[a_col].to_numpy(dtype=np.float64)
+                rad = np.deg2rad(raw_ang) if is_degrees else raw_ang
+
+                L = calc_bounding_box(x, y, rad)
                 if L < best_scores.get(n_int, float("inf")) - 1e-9:
-                    if is_valid_packing(x, y, ang):
+                    if is_valid_packing(x, y, rad):
                         best_scores[n_int] = L
-                        best_packings[n_int] = group.drop(columns=["_p_key"]).copy()
+                        best_packings[n_int] = (x, y, rad)
                         improvements += 1
             print(f"Parsed {path} -> {improvements} puzzle upgrades", flush=True)
         except Exception as e:
             print(f"Error parsing {path}: {e}", flush=True)
 
     if len(best_packings) >= 900:
-        merged_df = pd.concat([best_packings[k] for k in sorted(best_packings.keys())], ignore_index=True)
+        rows_n, rows_sid, rows_x, rows_y, rows_a = [], [], [], [], []
+        for n_int in sorted(best_packings.keys()):
+            x, y, rad = best_packings[n_int]
+            rows_n.extend([n_int] * n_int)
+            rows_sid.extend(range(n_int))
+            rows_x.append(x)
+            rows_y.append(y)
+            rows_a.append(rad)
+        merged_df = pd.DataFrame({
+            "id": np.arange(len(rows_n)),
+            "n": rows_n,
+            "square_id": rows_sid,
+            "x": np.concatenate(rows_x),
+            "y": np.concatenate(rows_y),
+            "angle": np.concatenate(rows_a),
+        })
         merged_df.to_csv("latest_public.csv", index=False)
         comp_score = sum((best_scores[n] - np.sqrt(n)) / np.sqrt(n) for n in best_scores)
         print(f"SUCCESS: Ensembled {len(best_packings)} puzzles! Kaggle Score: {comp_score:.6f} | Total L: {sum(best_scores.values()):.5f}", flush=True)
