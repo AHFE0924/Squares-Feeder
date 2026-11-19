@@ -8,32 +8,56 @@ on:
 permissions:
   contents: write
 
+# never run two scrapes at once; a new one waits for the running one
+concurrency:
+  group: feed
+  cancel-in-progress: false
+
 jobs:
   update-csv:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install Dependencies
         run: |
           pip install git+https://github.com/Kaggle/kaggle-api.git
-          pip install pandas
+          pip install pandas numpy
+
+      - name: Add the live notebook's best packings (branch "live"), if any
+        run: |
+          mkdir -p downloads/_live
+          if git fetch --depth 1 origin live 2>/dev/null; then
+            git show FETCH_HEAD:live_best.csv > downloads/_live/live_best.csv || rm -f downloads/_live/live_best.csv
+          fi
 
       - name: Run Scraper
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: python scrapescrapescrape.py
 
+      # If someone else pushed to main while the scrape ran, re-merge on top of their file and retry,
+      # instead of failing and throwing this run's result away.
       - name: Commit and Push Changes
         run: |
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "actions@github.com"
-          git add latest_public.csv
-          git commit -m "Auto-update latest_public.csv" || echo "No new changes to commit"
-          git push
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          for attempt in 1 2 3 4 5; do
+            git add latest_public.csv
+            if git diff --cached --quiet; then echo "No new changes to commit"; exit 0; fi
+            git commit -q -m "Auto-update latest_public.csv"
+            if git push; then exit 0; fi
+            echo "Push rejected (attempt $attempt): main moved, re-merging on top of it"
+            cp latest_public.csv "$RUNNER_TEMP/ours.csv"
+            git fetch origin main
+            git reset -q --hard FETCH_HEAD
+            python scrapescrapescrape.py --merge-only --extra "$RUNNER_TEMP/ours.csv"
+          done
+          echo "Gave up after 5 attempts"; exit 1
