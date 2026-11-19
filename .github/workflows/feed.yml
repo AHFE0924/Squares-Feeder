@@ -29,7 +29,7 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install git+https://github.com/Kaggle/kaggle-api.git
-          pip install pandas numpy
+          pip install pandas numpy mpmath
 
       - name: Add the live notebooks' best packings (branches live, live-1, live-2, live-3), if any
         run: |
@@ -63,3 +63,27 @@ jobs:
             python scrapescrapescrape.py --merge-only --extra "$RUNNER_TEMP/ours.csv"
           done
           echo "Gave up after 5 attempts"; exit 1
+
+      # Scores latest_public.csv with the official metric and submits it only if every puzzle passes,
+      # the score beats the last auto-submission, and fewer than 5 went in today (see auto_submit.py).
+      - name: Submit to Kaggle if the score improved
+        timeout-minutes: 40
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: python auto_submit.py
+
+      - name: Record the submission
+        run: |
+          if [ ! -f submit_state.json ] || { git ls-files --error-unmatch submit_state.json >/dev/null 2>&1 && git diff --quiet -- submit_state.json; }; then
+            echo "Nothing new to record"; exit 0
+          fi
+          cp submit_state.json "$RUNNER_TEMP/state.json"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git reset -q --hard FETCH_HEAD
+            cp "$RUNNER_TEMP/state.json" submit_state.json
+            git add submit_state.json
+            git commit -q -m "Record auto-submission" || exit 0
+            if git push; then exit 0; fi
+          done
+          exit 1

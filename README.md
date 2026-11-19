@@ -11,3 +11,8 @@ This is used to pull latest code from the Squares in Squares competition in Kagg
   `latest_public.csv` to main. Each of the three shard notebooks force-pushes one commit to its own
   branch (`live-1`, `live-2`, `live-3`), at most every 30 minutes, so the repo stops growing by 28 MB
   per push.
+- `auto_submit.py` – runs after each scrape. It scores `latest_public.csv` with the official
+  competition metric (copy from Sergio Fernández Rubio (GeiserX),
+  https://github.com/GeiserX/squares-in-squares) and submits it to Kaggle only if no puzzle is
+  rejected, the score beats the last automatic submission, and fewer than 5 went in that day.
+  `submit_state.json` records what was submitted.
