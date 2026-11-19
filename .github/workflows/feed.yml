@@ -31,12 +31,14 @@ jobs:
           pip install git+https://github.com/Kaggle/kaggle-api.git
           pip install pandas numpy
 
-      - name: Add the live notebook's best packings (branch "live"), if any
+      - name: Add the live notebooks' best packings (branches live, live-1, live-2, live-3), if any
         run: |
           mkdir -p downloads/_live
-          if git fetch --depth 1 origin live 2>/dev/null; then
-            git show FETCH_HEAD:live_best.csv > downloads/_live/live_best.csv || rm -f downloads/_live/live_best.csv
-          fi
+          for br in live live-1 live-2 live-3; do
+            if git fetch --depth 1 origin "$br" 2>/dev/null; then
+              git show FETCH_HEAD:live_best.csv > "downloads/_live/$br.csv" || rm -f "downloads/_live/$br.csv"
+            fi
+          done
 
       - name: Run Scraper
         env:
