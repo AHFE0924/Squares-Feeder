@@ -1,166 +1,252 @@
+"""Squares-Feeder: pull every public (and your own) Kaggle output for the Squares in Squares
+competition and keep the best valid packing for each n in latest_public.csv.
+
+  python scrapescrapescrape.py                               # download from Kaggle, then merge
+  python scrapescrapescrape.py --merge-only                  # re-merge what is already on disk
+  python scrapescrapescrape.py --merge-only --extra a.csv    # ... plus extra files (repeatable)
+
+latest_public.csv is always safe to submit as it is:
+  * columns id,n,square_id,x,y,angle; id runs 0..500499; angles in radians
+  * all 1000 puzzles present (a plain grid for any n no source covers)
+  * every pair of squares is at least CLEARANCE apart.  Packings whose squares touch exactly or
+    overlap by round-off are scaled up by the smallest factor that opens that gap, so the Kaggle
+    grader cannot reject a puzzle for it (a rejected puzzle is scored as a grid).
+"""
 import os
 import sys
 import glob
-import shutil
+import math
+import argparse
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pandas as pd
-from kaggle.api.kaggle_api_extended import KaggleApi
 
-# Force live real-time logging in GitHub Actions
 sys.stdout.reconfigure(line_buffering=True)
 
-def to_radians(ang):
-    # Auto-detects if angles are already in radians [-pi, pi] or degrees
-    return ang if np.max(np.abs(ang)) <= np.pi + 1e-4 else np.deg2rad(ang)
+COMPETITION = "squares-in-squares"
+OUT = "latest_public.csv"
+N_MAX = 1000
+CLEARANCE = 1e-10            # minimum gap between any two squares in the output
+DOWNLOAD_WORKERS = 4         # notebook outputs downloaded in parallel
+DOWNLOAD_TIMEOUT = 90        # seconds per notebook output
+SORTS = ("scoreAscending", "hotness", "dateRun", "voteCount")
+ANGLE_COLS = ("angle", "deg", "degrees", "angle_deg", "theta", "rotation", "rot", "r")
+DEGREE_COLS = ("deg", "degrees", "angle_deg")
 
-def calc_bounding_box(x, y, ang):
-    rad = to_radians(ang)
-    r = 0.5 * (np.abs(np.cos(rad)) + np.abs(np.sin(rad)))
-    lx = np.max(x + r) - np.min(x - r)
-    ly = np.max(y + r) - np.min(y - r)
-    return float(max(lx, ly))
 
-def is_valid_packing(x, y, ang, tol=1e-7):
-    n = len(x)
-    if n <= 1:
-        return True
-    dx = x[:, None] - x[None, :]
-    dy = y[:, None] - y[None, :]
-    dist2 = dx * dx + dy * dy
-    np.fill_diagonal(dist2, 999.0)
-    if np.min(dist2) < 1.0 - tol:
-        return False
+# ------------------------------------------------------------------------------ Kaggle download
 
-    mask = np.triu(dist2 < 2.0 + 1e-5, k=1)
-    i_idx, j_idx = np.where(mask)
-    if len(i_idx) == 0:
-        return True
+def download_outputs():
+    from kaggle.api.kaggle_api_extended import KaggleApi    # only needed when downloading
 
-    rad = to_radians(ang)
-    c, s = np.cos(rad), np.sin(rad)
-    rx, ry = x[j_idx] - x[i_idx], y[j_idx] - y[i_idx]
-    ci, si = c[i_idx], s[i_idx]
-    cj, sj = c[j_idx], s[j_idx]
+    print("Authenticating with Kaggle API...")
+    api = KaggleApi()
+    api.authenticate()
 
-    thresh = 0.5 + 0.5 * (np.abs(ci * cj + si * sj) + np.abs(ci * sj - si * cj)) - tol
-    p1 = np.abs(rx * ci + ry * si)
-    p2 = np.abs(-rx * si + ry * ci)
-    p3 = np.abs(rx * cj + ry * sj)
-    p4 = np.abs(-rx * sj + ry * cj)
+    refs, seen = [], set()
 
-    max_sep = np.maximum(np.maximum(p1, p2), np.maximum(p3, p4))
-    return bool(np.all(max_sep >= thresh))
+    def add(kernels, tag):
+        for k in kernels:
+            if k.ref not in seen:
+                seen.add(k.ref)
+                refs.append((k.ref, tag))
 
-def extract_puzzle_key(df):
-    cols = {c.lower(): c for c in df.columns}
+    try:
+        add(api.kernels_list(mine=True, competition=COMPETITION, page_size=25), "mine")
+    except Exception as e:
+        print(f"Listing your own notebooks failed: {e}")
+    for sort_mode in SORTS:
+        try:
+            add(api.kernels_list(competition=COMPETITION, sort_by=sort_mode, page_size=25), sort_mode)
+        except Exception as e:
+            print(f"Listing notebooks by {sort_mode} failed: {e}")
+    print(f"{len(refs)} notebooks to download ({DOWNLOAD_WORKERS} at a time)...")
+
+    def fetch(item):
+        ref, tag = item
+        out_dir = os.path.join("downloads", ref.replace("/", "_"))
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            r = subprocess.run(["kaggle", "kernels", "output", ref, "-p", out_dir, "-q"],
+                               timeout=DOWNLOAD_TIMEOUT, check=False, capture_output=True)
+            ok = r.returncode == 0
+        except subprocess.TimeoutExpired:
+            ok = False
+        print(f"  {'ok     ' if ok else 'failed '} {ref} ({tag})")
+        return ok
+
+    with ThreadPoolExecutor(DOWNLOAD_WORKERS) as pool:
+        n_ok = sum(pool.map(fetch, refs))
+    print(f"Downloaded {n_ok}/{len(refs)} notebook outputs.")
+
+
+# ------------------------------------------------------------------------------ geometry
+
+def half_extent(a):
+    return 0.5 * (np.abs(np.cos(a)) + np.abs(np.sin(a)))
+
+
+def side_length(x, y, a):
+    h = half_extent(a)
+    return float(max((x + h).max() - (x - h).min(), (y + h).max() - (y - h).min()))
+
+
+def _pair_gaps(x, y, a):
+    """Separating-axis gap of every pair whose centres are close enough to touch."""
+    dx = x[None, :] - x[:, None]
+    dy = y[None, :] - y[:, None]
+    I, J = np.nonzero(np.triu(dx * dx + dy * dy < 2.01, 1))   # centres >= sqrt(2) apart never touch
+    if len(I) == 0:
+        return None, None
+    c, s = np.cos(a), np.sin(a)
+    rx, ry = x[J] - x[I], y[J] - y[I]
+    ci, si, cj, sj = c[I], s[I], c[J], s[J]
+    ext = 0.5 + 0.5 * (np.abs(ci * cj + si * sj) + np.abs(si * cj - ci * sj))
+    proj = np.max(np.abs(np.stack([rx * ci + ry * si, -rx * si + ry * ci,
+                                   rx * cj + ry * sj, -rx * sj + ry * cj])), axis=0)
+    return proj, ext
+
+
+def make_safe(x, y, a):
+    """Scale the centres so that every gap is >= CLEARANCE. Returns (x, y, L) or None if impossible."""
+    if len(x) == 1:
+        return x, y, side_length(x, y, a)
+    proj, ext = _pair_gaps(x, y, a)
+    if proj is None:
+        return x, y, side_length(x, y, a)
+    if proj.min() < 1e-9:                       # two centres on top of each other
+        return None
+    need = float(((ext + CLEARANCE) / proj).max())
+    if need > 1.0:
+        f = need * (1.0 + 4e-16)
+        cx, cy = x.mean(), y.mean()
+        x = cx + (x - cx) * f
+        y = cy + (y - cy) * f
+        proj, ext = _pair_gaps(x, y, a)
+        if proj is not None and (proj - ext).min() < 0.9 * CLEARANCE:
+            return None
+    return x, y, side_length(x, y, a)
+
+
+# ------------------------------------------------------------------------------ merge
+
+def puzzle_key(df, cols):
     if "n" in cols:
-        return df[cols["n"]].astype(int)
+        return pd.to_numeric(df[cols["n"]], errors="coerce")
     if "puzzle" in cols:
-        return df[cols["puzzle"]].astype(int)
+        return pd.to_numeric(df[cols["puzzle"]], errors="coerce")
     if "id" in cols:
         sample = str(df[cols["id"]].iloc[0])
         if "_" in sample or "-" in sample:
             sep = "_" if "_" in sample else "-"
-            return df[cols["id"]].astype(str).str.split(sep).str[0].astype(int)
+            return pd.to_numeric(df[cols["id"]].astype(str).str.split(sep).str[0], errors="coerce")
     return None
 
-def run_scraper():
-    print("Authenticating with Kaggle API...", flush=True)
-    api = KaggleApi()
-    api.authenticate()
-    os.makedirs("downloads", exist_ok=True)
 
-    seen_refs = set()
-    print("Checking your own Kaggle notebooks (mine=True)...", flush=True)
-    try:
-        for k in api.kernels_list(mine=True, competition="squares-in-squares", page_size=25):
-            if k.ref not in seen_refs:
-                seen_refs.add(k.ref)
-                out_dir = os.path.join("downloads", k.ref.replace("/", "_"))
-                os.makedirs(out_dir, exist_ok=True)
-                print(f"  -> Downloading YOUR notebook {k.ref} (35s timeout)...", flush=True)
-                subprocess.run(["kaggle", "kernels", "output", k.ref, "-p", out_dir, "-q"], timeout=35, check=False)
-    except Exception as e:
-        print(f"Mine kernels error: {e}", flush=True)
+def merge(paths):
+    best = {}            # n -> (L, x, y, angle_in_radians)
 
-    for sort_mode in ["scoreAscending", "hotness", "dateRun", "voteCount"]:
-        print(f"Checking top notebooks by {sort_mode}...", flush=True)
-        try:
-            kernels = api.kernels_list(competition="squares-in-squares", sort_by=sort_mode, page_size=25)
-            for k in kernels:
-                if k.ref not in seen_refs:
-                    seen_refs.add(k.ref)
-                    out_dir = os.path.join("downloads", k.ref.replace("/", "_"))
-                    os.makedirs(out_dir, exist_ok=True)
-                    print(f"  -> Downloading {k.ref} (35s timeout)...", flush=True)
-                    try:
-                        subprocess.run(
-                            ["kaggle", "kernels", "output", k.ref, "-p", out_dir, "-q"],
-                            timeout=35,
-                            check=False
-                        )
-                    except subprocess.TimeoutExpired:
-                        print(f"  -> Timeout on {k.ref}, skipping!", flush=True)
-        except Exception as e:
-            print(f"Sort {sort_mode} error: {e}", flush=True)
-
-    csv_files = []
-    if os.path.exists("latest_public.csv"):
-        csv_files.append("latest_public.csv")
-    csv_files.extend(glob.glob("downloads/**/*.csv", recursive=True))
-
-    print(f"Found {len(csv_files)} CSV files. Starting puzzle-level ensemble...", flush=True)
-    if not csv_files:
-        return
-
-    best_packings = {}
-    best_scores = {}
-
-    for path in csv_files:
-        if os.path.getsize(path) < 100000:
+    for path in paths:
+        if not os.path.exists(path) or os.path.getsize(path) < 1000:
             continue
         try:
             df = pd.read_csv(path)
-            cols = {c.lower(): c for c in df.columns}
-            x_col, y_col = cols.get("x"), cols.get("y")
-            a_col = cols.get("deg") or cols.get("angle") or cols.get("theta") or cols.get("r")
-            if not (x_col and y_col and a_col):
-                continue
-
-            p_key = extract_puzzle_key(df)
-            if p_key is None:
-                continue
-
-            df["_p_key"] = p_key
-            improvements = 0
-            for n_val, group in df.groupby("_p_key", sort=False):
-                n_int = int(n_val)
-                if len(group) != n_int:
-                    continue
-                x = group[x_col].to_numpy(dtype=np.float64)
-                y = group[y_col].to_numpy(dtype=np.float64)
-                ang = group[a_col].to_numpy(dtype=np.float64)
-                L = calc_bounding_box(x, y, ang)
-                if L < best_scores.get(n_int, float("inf")) - 1e-9:
-                    if is_valid_packing(x, y, ang):
-                        best_scores[n_int] = L
-                        best_packings[n_int] = group.drop(columns=["_p_key"]).copy()
-                        improvements += 1
-            print(f"Parsed {path} -> {improvements} puzzle upgrades", flush=True)
         except Exception as e:
-            print(f"Error parsing {path}: {e}", flush=True)
+            print(f"Skipped {path}: {type(e).__name__}: {e}")
+            continue
+        cols = {str(c).lower().strip(): c for c in df.columns}
+        a_key = next((k for k in ANGLE_COLS if k in cols), None)
+        key = puzzle_key(df, cols)
+        if "x" not in cols or "y" not in cols or a_key is None or key is None:
+            continue
+        df = df.assign(_n=key).dropna(subset=["_n"])
+        ang = pd.to_numeric(df[cols[a_key]], errors="coerce")
+        if ang.isna().all():
+            continue
+        amax = float(np.nanmax(np.abs(ang.to_numpy(dtype=np.float64))))
+        # Unit is decided per file. Values up to 2*pi can be radians or small degree tilts: try both.
+        if a_key in DEGREE_COLS or amax > 2 * math.pi + 1e-6:
+            units = ("deg",)
+        else:
+            units = ("rad", "deg")
 
-    if len(best_packings) >= 900:
-        merged_df = pd.concat([best_packings[k] for k in sorted(best_packings.keys())], ignore_index=True)
-        merged_df.to_csv("latest_public.csv", index=False)
-        comp_score = sum((best_scores[n] - np.sqrt(n)) / np.sqrt(n) for n in best_scores)
-        print(f"SUCCESS: Ensembled {len(best_packings)} puzzles! Kaggle Score: {comp_score:.6f} | Total L: {sum(best_scores.values()):.5f}", flush=True)
-    else:
-        best_csv = max(csv_files, key=os.path.getsize)
-        if best_csv != "latest_public.csv":
-            shutil.copy(best_csv, "latest_public.csv")
-        print(f"Fallback: copied {best_csv}", flush=True)
+        upgrades = 0
+        for n_val, g in df.groupby("_n", sort=False):
+            n = int(n_val)
+            if n < 1 or n > N_MAX or len(g) != n:
+                continue
+            if "square_id" in cols:
+                g = g.sort_values(cols["square_id"])
+            x = pd.to_numeric(g[cols["x"]], errors="coerce").to_numpy(dtype=np.float64)
+            y = pd.to_numeric(g[cols["y"]], errors="coerce").to_numpy(dtype=np.float64)
+            raw = pd.to_numeric(g[cols[a_key]], errors="coerce").to_numpy(dtype=np.float64)
+            if not (np.isfinite(x).all() and np.isfinite(y).all() and np.isfinite(raw).all()):
+                continue
+            for unit in units:
+                a = np.deg2rad(raw) if unit == "deg" else raw
+                cur = best.get(n, (math.inf,))[0]
+                if side_length(x, y, a) >= cur - 1e-12:      # making it safe can only make it larger
+                    continue
+                safe = make_safe(x, y, a)
+                if safe is not None and safe[2] < cur - 1e-12:
+                    best[n] = (safe[2], safe[0], safe[1], a.copy())
+                    upgrades += 1
+        print(f"Parsed {path} -> {upgrades} puzzle upgrades")
+    return best
+
+
+def grid(n):
+    k = math.ceil(math.sqrt(n))
+    i = np.arange(n)
+    return float(k), 0.5 + (i % k), 0.5 + (i // k), np.zeros(n)
+
+
+def write_output(best):
+    missing = [n for n in range(1, N_MAX + 1) if n not in best]
+    for n in missing:
+        best[n] = grid(n)
+    ns, sids, xs, ys, angs = [], [], [], [], []
+    for n in range(1, N_MAX + 1):
+        _, x, y, a = best[n]
+        ns.append(np.full(n, n)); sids.append(np.arange(n))
+        xs.append(x); ys.append(y); angs.append(a)
+    x = np.concatenate(xs); y = np.concatenate(ys); a = np.concatenate(angs)
+    out = pd.DataFrame({
+        "id": np.arange(len(x)),
+        "n": np.concatenate(ns),
+        "square_id": np.concatenate(sids),
+        "x": [repr(float(v)) for v in x],          # shortest exact round-trip of each double
+        "y": [repr(float(v)) for v in y],
+        "angle": [repr(float(v)) for v in a],
+    })
+    tmp = OUT + ".tmp"
+    out.to_csv(tmp, index=False)
+    os.replace(tmp, OUT)
+    score = sum(best[n][0] / math.sqrt(n) - 1.0 for n in range(1, N_MAX + 1))
+    note = f" | {len(missing)} puzzles filled with a grid" if missing else ""
+    print(f"SUCCESS: wrote {OUT} | Kaggle score {score:.6f}{note}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--merge-only", action="store_true", help="skip the Kaggle download")
+    ap.add_argument("--extra", action="append", default=[], help="additional CSV to merge (repeatable)")
+    args = ap.parse_args()
+
+    if not args.merge_only:
+        download_outputs()
+
+    # current file first: it already holds the best known packings, so most others are skipped fast
+    paths = [OUT] + args.extra + sorted(glob.glob("downloads/**/*.csv", recursive=True))
+    print(f"Merging {len(paths)} CSV files...")
+    best = merge(paths)
+    if not best:
+        print(f"Nothing could be parsed; leaving {OUT} untouched.")
+        return
+    write_output(best)
+
 
 if __name__ == "__main__":
-    run_scraper()
+    main()
